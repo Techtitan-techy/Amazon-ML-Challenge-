@@ -1,0 +1,15 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large dataset and prediction TSV files (exceeds GitHub 100MB limit)
+output/*.tsv
+*.tsv
+*.zip
+*.tar.gz
+
+# OS and IDE files
+.DS_Store
+.vscode/
+.idea/

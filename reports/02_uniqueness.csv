@@ -1,0 +1,22 @@
+source,test,unique_values,total_rows,uniqueness_ratio,uniqueness_pct
+S1,Raw name uniqueness,1539229,2206821,0.697487,69.75
+S1,Normalized name uniqueness,1520684,2206821,0.689084,68.91
+S1,Raw address uniqueness,2130606,2206821,0.965464,96.55
+S1,Normalized address uniqueness,2130168,2206821,0.965265,96.53
+S1,Name+address uniqueness,2206821,2206821,1.0,100.0
+S1,Name+postal uniqueness,1572894,2206821,0.712742,71.27
+S1,Address+postal uniqueness,2130168,2206821,0.965265,96.53
+S2,Raw name uniqueness,4402009,5034616,0.874349,87.43
+S2,Normalized name uniqueness,3824065,5034616,0.759554,75.96
+S2,Raw address uniqueness,4337261,5034616,0.861488,86.15
+S2,Normalized address uniqueness,4281381,5034616,0.850389,85.04
+S2,Name+address uniqueness,4961811,5034616,0.985539,98.55
+S2,Name+postal uniqueness,3895673,5034616,0.773778,77.38
+S2,Address+postal uniqueness,4281382,5034616,0.850389,85.04
+S3,Raw name uniqueness,4651609,5285603,0.880053,88.01
+S3,Normalized name uniqueness,4132933,5285603,0.781923,78.19
+S3,Raw address uniqueness,4632764,5285603,0.876487,87.65
+S3,Normalized address uniqueness,4614550,5285603,0.873041,87.3
+S3,Name+address uniqueness,5233232,5285603,0.990092,99.01
+S3,Name+postal uniqueness,4207849,5285603,0.796096,79.61
+S3,Address+postal uniqueness,4614551,5285603,0.873042,87.3

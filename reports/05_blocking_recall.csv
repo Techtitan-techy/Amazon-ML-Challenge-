@@ -1,0 +1,7 @@
+blocker,recall,hits,total_candidates,time_sec
+B1_exact_name,0.2077,17974,239800,2.74
+B2_exact_address,0.0803,6947,8487,4.15
+B3_name_and_address,0.0122,1055,1055,6.46
+B4_name_and_postal,0.0109,942,942,1.68
+B5_address_and_postal,0.0291,2514,46762,0.98
+B10_hybrid_exact_union,0.2758,23866,247232,0.5

@@ -1,0 +1,8 @@
+policy,candidate_recall,total_candidates,avg_candidates_per_s1,candidate_reduction_pct,true_hits
+Fixed K=30 (Baseline),98.35,600000,30.0,0.0,67828
+"Adaptive Ratio 0.20 (min=3, max=30)",98.35,599995,30.0,0.0,67828
+"Adaptive Ratio 0.25 (min=3, max=30)",98.35,599555,29.98,0.07,67828
+"Adaptive Ratio 0.30 (min=3, max=30)",98.35,596944,29.85,0.51,67827
+"Adaptive Ratio 0.35 (min=3, max=30)",98.34,587250,29.36,2.12,67817
+"Adaptive Steep Dropoff (top >= 0.85 & gap > 0.40 -> K=3, else 30)",97.08,334056,16.7,44.32,66947
+Adaptive Hybrid (Ratio 0.25 + Steep Dropoff),97.08,334056,16.7,44.32,66947

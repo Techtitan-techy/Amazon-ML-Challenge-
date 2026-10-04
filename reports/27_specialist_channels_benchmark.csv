@@ -1,0 +1,8 @@
+configuration,candidate_recall,candidate_precision,avg_candidates_per_s1,total_candidates,final_macro_f05,pair_precision,pair_recall,elapsed_sec
+Baseline_K30,0.9835,0.113,30.0,600000,0.9617,0.9819,0.9473,52.2
+K30 + Indic_Phonetic,0.9838,0.1114,30.45,609043,0.9616,0.9819,0.9466,55.5
+K30 + Missing_Addr_Fallback,0.9858,0.1021,33.29,665753,0.9619,0.9821,0.9448,54.0
+K30 + State_Expansion,0.9903,0.1055,32.38,647541,0.962,0.9817,0.9418,45.5
+K30 + All_Specialist,0.9914,0.0953,35.88,717656,0.9624,0.9817,0.9405,49.3
+Baseline_K50,0.9929,0.0729,46.98,939664,0.962,0.9814,0.9387,66.3
+K50 + All_Specialist,0.9939,0.0684,50.13,1002614,0.9622,0.9819,0.9371,63.4

@@ -1,0 +1,8 @@
+{
+  "total_previous_fn": 3020,
+  "recovered_fn_total": 665,
+  "recovered_fn_pct": 22.02,
+  "total_missing_address_fn": 1069,
+  "recovered_missing_address_fn": 464,
+  "recovered_missing_address_pct": 43.41
+}

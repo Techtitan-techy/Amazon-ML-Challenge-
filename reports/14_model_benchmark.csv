@@ -1,0 +1,4 @@
+model,precision,recall,pair_f05,macro_f05,pr_auc,train_time_sec,infer_time_sec
+LogisticRegression,0.988,0.9958,0.9895,0.9639,0.9977,0.29,0.011
+LightGBM,0.9881,0.9987,0.9902,0.9652,0.9987,2.89,0.033
+XGBoost,0.9883,0.9988,0.9903,0.9656,0.9987,0.66,0.03

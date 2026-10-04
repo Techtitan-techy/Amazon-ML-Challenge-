@@ -1,0 +1,37 @@
+[
+  {
+    "failure_type": "Missing address",
+    "count": 1069,
+    "pct_of_fn": 35.4
+  },
+  {
+    "failure_type": "Address weak / name strong",
+    "count": 521,
+    "pct_of_fn": 17.25
+  },
+  {
+    "failure_type": "Other residual",
+    "count": 477,
+    "pct_of_fn": 15.79
+  },
+  {
+    "failure_type": "Name weak / address strong",
+    "count": 475,
+    "pct_of_fn": 15.73
+  },
+  {
+    "failure_type": "Both moderately similar",
+    "count": 305,
+    "pct_of_fn": 10.1
+  },
+  {
+    "failure_type": "Transliteration / phonetic variation",
+    "count": 146,
+    "pct_of_fn": 4.83
+  },
+  {
+    "failure_type": "Acronym / name truncation",
+    "count": 27,
+    "pct_of_fn": 0.89
+  }
+]

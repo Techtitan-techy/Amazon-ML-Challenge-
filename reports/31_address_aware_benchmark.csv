@@ -1,0 +1,6 @@
+configuration,pair_precision,pair_recall,macro_f05,accepted_pairs,true_positives,false_positives
+1. Baseline XGBoost (Flat 0.70),0.9821,0.9398,0.96518,65993,64813,1180
+2. Address-Aware Model (Flat 0.70),0.982,0.9397,0.9649,65990,64805,1185
+3. Address-Aware + Missingness Calibration,0.9775,0.9465,0.96304,66776,65276,1500
+4. Address-Aware (Threshold 0.65),0.9797,0.9438,0.96442,66442,65090,1352
+4. Address-Aware (Threshold 0.60),0.977,0.9481,0.96372,66921,65385,1536

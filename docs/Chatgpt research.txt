@@ -1,0 +1,3871 @@
+# Amazon ML Challenge 2026 — Deep Technical Research & Recommended Solution
+
+I reviewed the **updated Business Entity Resolution problem statement** as the authoritative specification and cross-checked the proposed design against current entity-resolution literature and tooling research.
+
+The central conclusion is:
+
+> **Do not build this as “a fuzzy matching model.” Build it as a precision-controlled, multi-pass retrieval + pairwise classification + entity-level decision system.**
+
+The challenge's updated rules make **candidate generation itself strategically important**: `candidate_pairs.tsv` is the exact final candidate set fed to the matcher, Amazon will analyze its recall ceiling and reduction ratio, and smaller candidate sets receive consideration in final ranking. 
+
+The other critical property is the evaluation metric: **macro F₀.₅ over Source-1 entities**, including singletons. A singleton gets 1.0 only if you correctly output no match, and false merges are explicitly penalized. 
+
+---
+
+# 0. Executive recommendation
+
+I would build the final system around:
+
+```text
+                         TRAINING
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+        S1 reference                S2 + S3 records
+              │                           │
+              └─────────────┬─────────────┘
+                            │
+                     Data profiling
+                            │
+                  ┌─────────▼─────────┐
+                  │ Normalization     │
+                  │ multi-view        │
+                  └─────────┬─────────┘
+                            │
+              ┌─────────────┼────────────────┐
+              │             │                │
+          exact keys     lexical index     ANN optional
+              │             │                │
+              └─────────────┼────────────────┘
+                            │
+                     Multi-pass blocking
+                            │
+                  Candidate union/dedup
+                            │
+                Candidate diagnostics
+                            │
+              ┌─────────────▼─────────────┐
+              │ Pair feature generation   │
+              │ ~50–100 carefully chosen  │
+              │ features                  │
+              └─────────────┬─────────────┘
+                            │
+                     CatBoost / XGBoost
+                            │
+                   calibrated score
+                            │
+                 ┌──────────▼───────────┐
+                 │ Entity-level decision│
+                 │ threshold + margin   │
+                 │ singleton gate       │
+                 └──────────┬───────────┘
+                            │
+                  final S1 → {S2,S3}
+                            │
+                 ┌──────────▼───────────┐
+                 │ matching_results.tsv │
+                 │ candidate_pairs.tsv │
+                 └──────────────────────┘
+```
+
+**Primary matcher:** CatBoost or LightGBM/XGBoost on engineered pair features.
+
+**Primary retrieval:** multi-pass exact/structured + character TF-IDF retrieval + token retrieval.
+
+**Optional advanced retrieval:** multilingual sentence embeddings only if experiments demonstrate meaningful candidate-recall improvement.
+
+**Transformer:** optional second-stage reranker for difficult pairs, not the primary architecture.
+
+**LLM:** do not use.
+
+**External business data:** absolutely do not use.
+
+---
+
+# 1. What the challenge actually is
+
+The supplied specification says:
+
+* Source 1 is the deduplicated reference source.
+* Every S1 entity may have **zero, one, or many** S2/S3 matches.
+* There are no shared identifiers.
+* Fields are noisy.
+* Training contains US and India.
+* Test additionally contains **France**.
+* The country field must therefore be treated as an **open-set string**, not `{US, India}`. 
+
+This immediately rules out several simplistic approaches.
+
+### Wrong mental model
+
+```text
+S1 → find the single closest S2/S3 record
+```
+
+### Correct mental model
+
+```text
+S1 → retrieve plausible S2/S3 candidates
+   → independently score every candidate
+   → determine which candidates cross an entity-specific decision boundary
+   → possibly return 0, 1, or many
+```
+
+This distinction matters enormously.
+
+The problem is closer to:
+
+$$
+P(match_{ij}=1|S1_i,S2_j/S3_j)
+$$
+
+followed by:
+
+$$
+\hat{M_i}=\{j:P_{ij}>\tau_i\}
+$$
+
+rather than a nearest-neighbor problem.
+
+---
+
+# 2. Data analysis
+
+There is one important limitation at this stage:
+
+**The uploaded materials contain the specification and documentation template, but not the actual `train_source1.tsv`, `train_source2.tsv`, `train_source3.tsv`, or `train_ground_truth.tsv` datasets.**
+
+Therefore I will not invent:
+
+* row counts,
+* class imbalance,
+* singleton percentage,
+* average match cardinality,
+* country frequencies,
+* missingness,
+* duplicate rates,
+* actual name/address distributions.
+
+Those must be measured during Phase 0.
+
+The specification establishes the available schema:
+
+```text
+entity_id
+business_name
+business_address
+country
+```
+
+and ground truth:
+
+```text
+source1_entity_id
+matched_entity_ids
+```
+
+
+
+---
+
+## 2.1 Required EDA
+
+Calculate:
+
+### Dataset scale
+
+```text
+N(S1)
+N(S2)
+N(S3)
+
+N(S1) × N(S2)
+N(S1) × N(S3)
+```
+
+This establishes the naive Cartesian search size.
+
+---
+
+### Missingness
+
+For each source:
+
+```text
+name_missing_rate
+address_missing_rate
+country_missing_rate
+name_empty_rate
+address_empty_rate
+```
+
+Then combinations:
+
+```text
+name + address present
+name only
+address only
+neither
+```
+
+---
+
+### Match cardinality
+
+For each S1:
+
+```text
+k_i = number of ground-truth matches
+```
+
+Measure:
+
+```text
+P(k=0)
+P(k=1)
+P(k=2)
+P(k>=3)
+mean(k)
+median(k)
+max(k)
+```
+
+This is essential because the final decision logic depends heavily on cardinality.
+
+---
+
+### Singleton rate
+
+Define:
+
+$$
+singleton\_rate =
+\frac{\#\{i:k_i=0\}}{|S1|}
+$$
+
+Do **not** assume it is small.
+
+Because singleton entities receive a perfect per-entity score when correctly predicted empty, singleton handling could become one of the highest-return components of the system. 
+
+---
+
+# 3. Validation design
+
+This is one of the most important parts of the project.
+
+A random pair-level train/validation split is dangerous.
+
+Suppose:
+
+```text
+S1-A ↔ S2-X
+S1-A ↔ S3-Y
+```
+
+If one pair is placed in training and the other in validation, the model may indirectly see the same entity during both phases.
+
+That can make validation overly optimistic.
+
+---
+
+## Recommended validation structure
+
+Split at the **S1 entity level**.
+
+```text
+TRAIN S1 entities
+        │
+        ├── all associated S2/S3 records
+        │
+        └── ground truth
+
+VALIDATION S1 entities
+        │
+        ├── their associated records
+        │
+        └── ground truth
+```
+
+But there is an additional issue.
+
+Because candidate generation operates against a pool, validation candidates must be generated using only information that would legitimately be available at inference.
+
+Do not allow ground truth to influence blocking.
+
+---
+
+## Better: repeated grouped validation
+
+Use:
+
+```text
+Fold 1: 80/20 S1 split
+Fold 2: 80/20
+Fold 3: 80/20
+```
+
+or at minimum:
+
+```text
+development
+holdout
+```
+
+with the holdout never touched during tuning.
+
+The public/private leaderboard split makes this particularly important because the final ranking is based on the private set. 
+
+---
+
+# 4. Leakage risks
+
+There are several.
+
+## Leakage #1 — target-derived normalization
+
+Do not create normalization rules such as:
+
+```text
+"X" → "Y"
+```
+
+because you discovered them by looking at the validation ground truth.
+
+Allowed:
+
+```text
+lowercase
+unicode normalization
+punctuation removal
+whitespace normalization
+generic abbreviation handling
+```
+
+Potentially dangerous:
+
+```text
+business-specific substitution learned from validation labels
+```
+
+---
+
+## Leakage #2 — target-derived blocking
+
+Do not discover:
+
+```text
+"abc hospital" commonly matches "abc hosp"
+```
+
+from validation labels and then hard-code it.
+
+---
+
+## Leakage #3 — target-aware frequency features
+
+Frequency statistics can be useful, but calculate them in a leakage-safe way.
+
+The general idea of frequency-adjusted comparison is well established in probabilistic linkage: common values should provide less evidence than rare values. Splink explicitly implements term-frequency adjustments for this reason. ([Moj Analytical Services][1])
+
+But:
+
+```text
+frequency of "apollo"
+```
+
+is fine.
+
+```text
+probability that "apollo" is a match based on validation labels
+```
+
+must be calculated only within training.
+
+---
+
+# 5. Normalization
+
+Normalization should be **multi-view**, not destructive.
+
+This is a major design principle.
+
+Do **not** replace the original string with a single aggressively normalized version.
+
+Instead create:
+
+```text
+raw
+normalized_light
+normalized_token
+normalized_compact
+normalized_alnum
+```
+
+---
+
+# 6. Business-name normalization
+
+## View A — light normalization
+
+```text
+Unicode normalize
+lowercase
+trim whitespace
+normalize punctuation
+collapse repeated spaces
+```
+
+Example:
+
+```text
+"ABC & Sons Pvt. Ltd."
+        ↓
+"abc & sons pvt ltd"
+```
+
+---
+
+## View B — legal suffix normalized
+
+Create an additional representation:
+
+```text
+abc sons
+```
+
+where:
+
+```text
+pvt
+private
+pvt ltd
+private limited
+ltd
+limited
+corp
+corporation
+inc
+incorporated
+llc
+```
+
+are mapped to canonical forms or removed.
+
+But **do not discard the original**.
+
+Why?
+
+Because legal suffixes can sometimes help distinguish businesses.
+
+---
+
+# 7. `&` versus `and`
+
+Create:
+
+```text
+name_original_norm
+name_and_norm
+```
+
+Example:
+
+```text
+A & B Traders
+A and B Traders
+```
+
+This is a useful normalization.
+
+But replacing `&` universally could theoretically alter names where it is meaningful.
+
+Therefore retain both.
+
+---
+
+# 8. Token-order normalization
+
+Business names frequently undergo:
+
+```text
+ABC Medical Store
+Medical Store ABC
+```
+
+Create:
+
+```text
+token_sorted_name
+```
+
+but never replace the original ordering.
+
+Useful features:
+
+```text
+ordered_similarity
+unordered_similarity
+```
+
+This gives the model both pieces of evidence.
+
+---
+
+# 9. Transliteration
+
+This deserves special treatment.
+
+The specification explicitly warns about transliteration variants. 
+
+For example:
+
+```text
+शिव मेडिकल
+Shiv Medical
+```
+
+can represent the same business.
+
+A strong design is:
+
+```text
+original Unicode
+Unicode-normalized
+transliterated
+transliterated compact
+```
+
+Then compare:
+
+```text
+native ↔ native
+roman ↔ roman
+native ↔ roman
+```
+
+where possible.
+
+But do not automatically translate semantic content.
+
+Translation is much riskier than transliteration because:
+
+```text
+"medical store"
+```
+
+and
+
+```text
+"pharmacy"
+```
+
+could be semantically related but not necessarily identical.
+
+---
+
+# 10. Address normalization
+
+Address normalization should be considerably more conservative.
+
+Create components:
+
+```text
+address_raw
+address_normalized
+address_alnum
+address_tokens
+address_numbers
+address_postal_candidates
+address_street_tokens
+address_unit_tokens
+```
+
+---
+
+## Abbreviation normalization
+
+Examples:
+
+```text
+rd → road
+rd. → road
+st → street
+ave → avenue
+blvd → boulevard
+hwy → highway
+```
+
+and Indian-style abbreviations where supported by the training data.
+
+But the rule should be:
+
+> Only introduce transformations whose usefulness is demonstrated by validation.
+
+---
+
+# 11. Numbers are unusually important
+
+Do not throw numbers away.
+
+Extract:
+
+```text
+all numeric sequences
+house numbers
+PIN/postal candidates
+suite/unit numbers
+building numbers
+road numbers
+```
+
+For example:
+
+```text
+"12-4-89/2, MG Road"
+```
+
+contains valuable information in:
+
+```text
+12
+4
+89
+2
+```
+
+Create:
+
+```text
+number_set
+number_multiset
+number_count
+shared_number_count
+shared_number_ratio
+exact_house_number
+postal_match
+```
+
+---
+
+# 12. Postal codes
+
+Postal codes are potentially extremely strong.
+
+But do not use:
+
+```text
+postal_code_exact → automatic match
+```
+
+because common or erroneous postal codes can collide.
+
+Instead:
+
+```text
+postal_exact
+postal_prefix
+postal_present_both
+postal_missing
+postal_conflict
+```
+
+and let the model combine them with name/address evidence.
+
+---
+
+# 13. What normalization can destroy
+
+Aggressive normalization can cause catastrophic false merges.
+
+Bad transformations include:
+
+```text
+remove all numbers
+remove all stopwords
+remove all geographic terms
+remove all legal words
+translate everything
+remove token ordering
+collapse everything into initials
+```
+
+For example:
+
+```text
+ABC Hotel, 12 MG Road
+ABC Hotel, 52 MG Road
+```
+
+becoming:
+
+```text
+abchotel mgroad
+```
+
+would destroy useful distinguishing information.
+
+Therefore:
+
+> **Normalization should create alternate views, never erase the evidence.**
+
+---
+
+# 14. Blocking: the most important component
+
+The challenge explicitly says blocking determines the recall ceiling and wants a small candidate set. 
+
+Classic entity matching literature also treats blocking and matching as distinct stages: blocking eliminates the vast majority of implausible pairs before expensive pairwise matching. ([CS UW][2])
+
+I recommend **multi-pass blocking**.
+
+---
+
+# 15. Blocking objective
+
+You actually have two competing objectives:
+
+$$
+\max Recall_{candidate}
+$$
+
+while minimizing:
+
+$$
+AverageCandidateCount
+$$
+
+and:
+
+$$
+CandidateReductionRatio
+$$
+
+The practical optimization target should be:
+
+```text
+Candidate recall ≥ very high threshold
+AND
+candidate count as low as possible
+```
+
+Do not optimize candidate count alone.
+
+A 99% reduction with 5% lost matches is disastrous.
+
+---
+
+# 16. Blocking Pass 1 — exact structured keys
+
+Start with high-precision keys.
+
+Examples:
+
+```text
+country + exact postal
+country + normalized phone-like numeric signature
+postal + rare name token
+```
+
+For this dataset:
+
+```text
+name_exact + country
+address_exact + country
+postal_exact + country
+```
+
+where available.
+
+These produce very small candidate sets.
+
+---
+
+# 17. Blocking Pass 2 — rare name tokens
+
+Create an inverted index:
+
+```text
+token → S2/S3 records
+```
+
+For each S1:
+
+```text
+rare_name_token → candidates
+```
+
+Do not use very common tokens.
+
+For example:
+
+```text
+"restaurant"
+"hotel"
+"store"
+"india"
+"company"
+```
+
+will produce huge blocks.
+
+Instead use inverse-frequency weighting.
+
+If:
+
+$$
+df(t)
+$$
+
+is the number of records containing token \(t\), use:
+
+$$
+idf(t)=\log\frac{N+1}{df(t)+1}
+$$
+
+and prioritize high-IDF tokens.
+
+This follows the same general principle as term-frequency adjustments used in probabilistic linkage. ([Moj Analytical Services][1])
+
+---
+
+# 18. Blocking Pass 3 — character n-gram retrieval
+
+This should be one of the core retrieval mechanisms.
+
+Use:
+
+```text
+character 3-grams
+character 4-grams
+character 5-grams
+```
+
+on:
+
+```text
+normalized name
+normalized address
+```
+
+TF-IDF sparse retrieval is particularly attractive here because it is:
+
+* CPU-friendly,
+* deterministic,
+* explainable,
+* fast,
+* robust to small spelling errors.
+
+The challenge itself specifically suggests TF-IDF cosine among useful string methods. 
+
+---
+
+# 19. Why character n-grams beat word-only retrieval here
+
+Consider:
+
+```text
+"shree lakshmi medical"
+"shri laxmi medical"
+```
+
+Word-token matching loses:
+
+```text
+shree ↔ shri
+lakshmi ↔ laxmi
+```
+
+Character n-grams preserve partial overlap.
+
+Likewise:
+
+```text
+restaurant
+resturant
+```
+
+still shares many character sequences.
+
+This is exactly the kind of corruption expected by the challenge.
+
+---
+
+# 20. Blocking Pass 4 — address retrieval
+
+Run a separate retrieval index for addresses.
+
+Do not simply concatenate name and address into one field.
+
+Why?
+
+Suppose:
+
+```text
+Name similarity = low
+Address similarity = extremely high
+```
+
+That may still be a valid match.
+
+Conversely:
+
+```text
+Name similarity = extremely high
+Address similarity = extremely low
+```
+
+may be a dangerous false merge.
+
+Separate indexes let you preserve these distinctions.
+
+---
+
+# 21. Blocking Pass 5 — token overlap
+
+Use token-based retrieval:
+
+```text
+Jaccard
+overlap coefficient
+containment
+```
+
+The record-linkage ecosystem supports blocking on agreement and multiple comparison metrics, while Splink provides Jaccard/Jaro/Levenshtein-style comparison levels. ([Record Linkage Toolkit][3])
+
+Useful particularly for:
+
+```text
+ABC Hospital MG Road
+MG Road ABC Hospital
+```
+
+---
+
+# 22. Blocking Pass 6 — phonetic retrieval
+
+Potentially useful for:
+
+```text
+Sharma
+Sarma
+```
+
+or:
+
+```text
+Kumar
+Koomar
+```
+
+But this must be tested.
+
+Do not assume:
+
+```text
+Soundex = useful
+```
+
+especially for multilingual data.
+
+Use phonetic keys as **one blocking pass**, never the sole blocker.
+
+---
+
+# 23. Blocking Pass 7 — adaptive retrieval
+
+This is one of the strongest innovations I would test.
+
+Instead of:
+
+```text
+top 20 candidates for every S1
+```
+
+use:
+
+```text
+easy entity → top 5
+ambiguous entity → top 20
+very noisy entity → top 50
+```
+
+The number of candidates depends on evidence quality.
+
+For example:
+
+### Strong S1
+
+```text
+exact postal
+rare name token
+high TF-IDF score
+```
+
+→ small candidate budget.
+
+### Weak S1
+
+```text
+missing address
+short name
+common name
+```
+
+→ larger candidate budget.
+
+This can substantially improve the candidate-size/recall Pareto frontier.
+
+---
+
+# 24. Candidate budget should not be fixed
+
+I recommend testing:
+
+```text
+K = 5
+K = 10
+K = 20
+K = 50
+K = 100
+```
+
+and then adaptive:
+
+```text
+K = f(name_quality, address_quality, token_rarity, retrieval_agreement)
+```
+
+Measure:
+
+```text
+candidate recall
+mean candidates
+P95 candidates
+P99 candidates
+reduction ratio
+runtime
+```
+
+---
+
+# 25. Multi-pass union
+
+The final candidates should be:
+
+$$
+C_i =
+C_{exact}
+\cup
+C_{token}
+\cup
+C_{char}
+\cup
+C_{address}
+\cup
+C_{phonetic}
+\cup
+C_{ANN}
+$$
+
+Then deduplicate.
+
+This is much safer than requiring a candidate to satisfy:
+
+```text
+name block AND address block
+```
+
+because missing/noisy fields can destroy recall.
+
+---
+
+# 26. A particularly important candidate-generation metric
+
+For every validation S1:
+
+```text
+true_match_ids
+candidate_ids
+```
+
+calculate:
+
+$$
+CandidateRecall_i =
+\frac{|True_i \cap Candidate_i|}
+{|True_i|}
+$$
+
+Then:
+
+$$
+MacroCandidateRecall =
+\frac{1}{N}\sum_i CandidateRecall_i
+$$
+
+Also calculate:
+
+```text
+% S1 entities with zero candidates
+% true matches lost
+```
+
+The latter is critical.
+
+A candidate recall of 99.8% sounds excellent until you discover:
+
+```text
+0.2% × 100,000 = 200 lost true matches
+```
+
+---
+
+# 27. Candidate reduction ratio
+
+Define:
+
+$$
+RR = 1 -
+\frac{|C|}
+{|S1|\times(|S2|+|S3|)}
+$$
+
+or report both:
+
+```text
+candidate pairs
+possible pairs
+reduction ratio
+average candidates/S1
+median candidates/S1
+P95
+P99
+```
+
+This makes your methodology highly defensible.
+
+---
+
+# 28. ANN / embeddings
+
+Embeddings are useful, but I would **not make them the first retrieval system**.
+
+Sentence-transformer systems can compute embeddings and similarity efficiently, including multilingual similarity tasks. ([GitHub][4])
+
+However, semantic embeddings have a fundamental problem here:
+
+```text
+ABC Medical Store
+```
+
+and
+
+```text
+ABC Medical Center
+```
+
+may be semantically close while representing different businesses.
+
+Entity resolution often requires **surface-form identity**, not semantic similarity.
+
+Therefore:
+
+### Embeddings
+
+Good for:
+
+```text
+transliteration
+paraphrase-like address variation
+long noisy addresses
+cross-language similarity
+```
+
+Bad as sole evidence for:
+
+```text
+exact identity
+postal precision
+house numbers
+business-name collisions
+```
+
+---
+
+# 29. Recommended ANN role
+
+Use ANN as a **recall booster**.
+
+```text
+TF-IDF candidates
+       +
+ANN candidates
+       ↓
+union
+```
+
+not:
+
+```text
+ANN → final answer
+```
+
+If ANN increases candidate recall from:
+
+```text
+99.1 → 99.7%
+```
+
+while increasing candidate volume from:
+
+```text
+18 → 24
+```
+
+it may be worthwhile.
+
+If it changes:
+
+```text
+99.5 → 99.55%
+```
+
+and doubles candidate count, remove it.
+
+---
+
+# 30. Pair feature engineering
+
+This is where a traditional ML model becomes extremely strong.
+
+I would build approximately **50–100 features**, but only retain those demonstrated to help.
+
+---
+
+# 31. Name features
+
+### Exact
+
+```text
+name_exact
+name_light_exact
+name_compact_exact
+name_token_sorted_exact
+```
+
+### Edit similarity
+
+```text
+Levenshtein ratio
+normalized edit distance
+Jaro-Winkler
+```
+
+### Token
+
+```text
+token Jaccard
+token overlap
+token containment
+token count difference
+common token count
+rare-token overlap
+```
+
+### Character
+
+```text
+char 2gram cosine
+char 3gram cosine
+char 4gram cosine
+char 5gram cosine
+```
+
+### Structural
+
+```text
+length difference
+length ratio
+first-token match
+last-token match
+initials match
+token-order similarity
+```
+
+---
+
+# 32. Name rarity features
+
+Extremely valuable.
+
+Suppose:
+
+```text
+"apollo"
+```
+
+appears 10,000 times.
+
+An exact match is not highly discriminative.
+
+But:
+
+```text
+"qz medical solutions"
+```
+
+appears once.
+
+An exact match is powerful.
+
+Create:
+
+```text
+name_token_max_idf
+name_token_mean_idf
+rare_token_count
+shared_rare_token_count
+name_frequency_left
+name_frequency_right
+```
+
+This is conceptually supported by term-frequency-adjusted linkage approaches. ([Moj Analytical Services][1])
+
+---
+
+# 33. Address features
+
+Use:
+
+```text
+address_char_cosine
+address_token_jaccard
+address_token_overlap
+address_levenshtein
+address_jaro
+address_containment
+```
+
+plus structured features:
+
+```text
+postal_exact
+postal_prefix_match
+house_number_exact
+shared_number_count
+shared_number_ratio
+street_token_overlap
+unit_number_match
+```
+
+---
+
+# 34. Address positional features
+
+These are underused and potentially valuable.
+
+Compare:
+
+```text
+first meaningful token
+last meaningful token
+numeric positions
+postal-code position
+```
+
+For example:
+
+```text
+"12 MG Road Hyderabad 500001"
+"12, MG Rd, Hyderabad - 500001"
+```
+
+has structural alignment even if token order changes slightly.
+
+---
+
+# 35. Country features
+
+Use:
+
+```text
+country_exact
+country_missing_left
+country_missing_right
+country_conflict
+```
+
+Do **not** hard-code:
+
+```python
+if country not in ["US", "India"]:
+    reject
+```
+
+The specification explicitly says France occurs in test and must not be filtered out. 
+
+---
+
+# 36. Cross-field features
+
+These may be more powerful than individual similarities.
+
+Examples:
+
+```text
+name_high & address_high
+name_high & postal_exact
+name_low & address_high
+name_high & address_low
+name_medium & postal_exact
+name_rare & address_medium
+```
+
+Rather than manually encode all interactions, give the model the component features and let boosting learn them.
+
+---
+
+# 37. Missingness features
+
+Never simply impute missing values to empty strings and forget about them.
+
+Create:
+
+```text
+name_missing_left
+name_missing_right
+address_missing_left
+address_missing_right
+both_name_missing
+both_address_missing
+```
+
+Missingness itself can carry information.
+
+---
+
+# 38. Source-specific features
+
+S1→S2 and S1→S3 may exhibit different corruption patterns.
+
+Therefore include:
+
+```text
+source_pair = S1_S2 / S1_S3
+```
+
+and possibly:
+
+```text
+source_pair × similarity features
+```
+
+CatBoost can model interactions naturally.
+
+---
+
+# 39. Candidate-source evidence
+
+An extremely useful feature:
+
+```text
+retrieved_by_exact_name
+retrieved_by_char_name
+retrieved_by_address
+retrieved_by_postal
+retrieved_by_embedding
+retrieved_by_token
+```
+
+and:
+
+```text
+number_of_blockers_that_retrieved_pair
+```
+
+A pair retrieved independently by four mechanisms is more suspiciously strong than one retrieved by a single weak mechanism.
+
+---
+
+# 40. Matching model comparison
+
+## Logistic regression
+
+### Advantages
+
+* extremely fast
+* interpretable
+* strong baseline
+* easy calibration
+
+### Disadvantages
+
+It assumes a largely linear relationship between features.
+
+Entity resolution contains interactions such as:
+
+```text
+postal_exact + name_similarity=0.82
+```
+
+being much stronger than either alone.
+
+### Verdict
+
+**Mandatory baseline.**
+
+Not my final model unless data shows otherwise.
+
+---
+
+# 41. XGBoost
+
+Very strong candidate.
+
+Advantages:
+
+* handles nonlinear interactions
+* fast
+* mature
+* CPU-friendly
+* excellent on engineered tabular features
+* interpretable through feature importance/SHAP
+
+XGBoost is explicitly designed as an efficient gradient boosting framework and supports large-scale problems. ([XGBoost Documentation][5])
+
+### Verdict
+
+**Top candidate.**
+
+---
+
+# 42. LightGBM
+
+Similar advantages:
+
+* very fast
+* efficient
+* handles missing values
+* strong tabular performance
+* CPU efficient
+
+Its categorical handling can also be useful. ([LightGBM Documentation][6])
+
+### Verdict
+
+**Strong alternative to XGBoost.**
+
+Run both rather than assuming one wins.
+
+---
+
+# 43. CatBoost
+
+CatBoost is particularly attractive here because it supports:
+
+* numerical features
+* categorical features
+* text features
+* embeddings
+* missing values
+
+and has built-in feature selection tooling. ([CatBoost][7])
+
+However, most of our high-value information can already be represented numerically.
+
+Therefore I would not use CatBoost because it is fashionable; I would test:
+
+```text
+CatBoost
+vs
+LightGBM
+vs
+XGBoost
+```
+
+on exactly the same feature matrix.
+
+---
+
+# 44. My expected winner
+
+My prior is:
+
+```text
+CatBoost ≈ LightGBM ≈ XGBoost
+```
+
+with the difference likely much smaller than the effect of:
+
+```text
+blocking
+features
+negative sampling
+thresholding
+```
+
+This is important.
+
+A mediocre blocker + excellent XGBoost is still mediocre.
+
+A great blocker + good XGBoost can be excellent.
+
+---
+
+# 45. Why not immediately use a Transformer?
+
+Transformers can be extremely strong entity matchers.
+
+Ditto, for example, casts entity matching as sequence-pair classification and demonstrated strong results on entity-matching benchmarks and a large company matching task. ([arXiv][8])
+
+But that does not mean:
+
+```text
+Transformer > CatBoost
+```
+
+for this challenge.
+
+The task has:
+
+* only three fields,
+* highly structured numbers,
+* postal codes,
+* exact lexical evidence,
+* explicit candidate-generation requirements,
+* precision-heavy F₀.₅,
+* CPU constraints in your environment.
+
+A Transformer may understand:
+
+```text
+"ABC medical"
+```
+
+better semantically.
+
+It may not understand the importance of:
+
+```text
+500001
+```
+
+versus:
+
+```text
+500002
+```
+
+as naturally as an engineered numeric feature.
+
+---
+
+# 46. Best use of Transformer
+
+If the data is sufficiently large:
+
+```text
+Stage 1:
+CatBoost
+
+Stage 2:
+Transformer only on uncertain pairs
+```
+
+For example:
+
+```text
+score < 0.2
+    → reject
+
+score > 0.9
+    → accept
+
+0.2–0.9
+    → Transformer reranker
+```
+
+This is a much more defensible use of deep learning.
+
+---
+
+# 47. Model licensing
+
+The challenge states that the final model must be:
+
+```text
+MIT or Apache 2.0
+≤ 8B parameters
+```
+
+
+
+Therefore every model and dependency must be audited.
+
+Do not casually insert:
+
+```text
+proprietary API
+closed LLM
+commercial embedding API
+```
+
+even if technically effective.
+
+---
+
+# 48. Negative sampling
+
+This could make or break the classifier.
+
+The number of possible negative pairs is enormous.
+
+Random negatives are too easy.
+
+Example:
+
+```text
+S1: "Apollo Hospital Hyderabad"
+S2: "Pizza Hut New York"
+```
+
+The model learns almost nothing from this.
+
+Instead use **hard negatives**.
+
+---
+
+# 49. Hard negative categories
+
+Generate negatives that have:
+
+### Same name, different address
+
+```text
+ABC Pharmacy
+ABC Pharmacy
+```
+
+but different locations.
+
+### Same address, different name
+
+```text
+Mall A Store
+Mall B Store
+```
+
+### Similar name
+
+```text
+Apollo Medical
+Apollo Healthcare
+```
+
+### Similar address
+
+```text
+12 MG Road
+12 MG Rd
+```
+
+but different business.
+
+### Same postal code
+
+Different business.
+
+### Same common token
+
+```text
+Shree
+```
+
+but different entity.
+
+These negatives teach the model the exact distinctions that matter.
+
+---
+
+# 50. Extremely important: hard negatives from the blocker
+
+A good trick:
+
+> Use candidates produced by your own blocker as the negative pool.
+
+Why?
+
+Because these are precisely the pairs the final model will actually see.
+
+This reduces train/inference distribution mismatch.
+
+---
+
+# 51. Thresholding
+
+Do **not** simply use:
+
+```text
+probability > 0.5
+```
+
+That threshold has no theoretical reason to be optimal for macro F₀.₅.
+
+---
+
+# 52. Optimize directly for F₀.₅
+
+For:
+
+```text
+threshold ∈ [0.1,0.2,...,0.99]
+```
+
+generate entity-level predictions and compute:
+
+$$
+F_{0.5}
+=
+\frac{1.25PR}{0.25P+R}
+$$
+
+exactly as the challenge specifies. 
+
+---
+
+# 53. But one global threshold may not be enough
+
+Consider:
+
+### Entity A
+
+```text
+name: very distinctive
+address: strong
+```
+
+A score of 0.82 could be extremely convincing.
+
+### Entity B
+
+```text
+name: "restaurant"
+address: incomplete
+```
+
+0.82 may be dangerous.
+
+Therefore test:
+
+```text
+global threshold
+```
+
+versus:
+
+```text
+entity-adaptive threshold
+```
+
+---
+
+# 54. Adaptive threshold
+
+Potential formula:
+
+$$
+\tau_i=f(
+name\_rarity,
+address\_quality,
+candidate\_ambiguity,
+country,
+retrieval\_agreement
+)
+$$
+
+For example:
+
+```text
+high ambiguity → higher threshold
+low ambiguity → lower threshold
+```
+
+This is particularly compatible with F₀.₅.
+
+---
+
+# 55. Margin-based decision
+
+Another powerful feature:
+
+```text
+best_score
+second_best_score
+```
+
+and:
+
+$$
+margin = score_1-score_2
+$$
+
+Example:
+
+```text
+best = 0.91
+second = 0.52
+margin = 0.39
+```
+
+versus:
+
+```text
+best = 0.91
+second = 0.89
+margin = 0.02
+```
+
+The latter is ambiguous.
+
+---
+
+# 56. But beware: many matches are allowed
+
+A common mistake is:
+
+```text
+only keep best candidate
+```
+
+The specification explicitly permits zero, one, or many matches per S1. 
+
+Therefore margin should not mean:
+
+```text
+winner takes all
+```
+
+It should mean:
+
+```text
+confidence in each candidate + ambiguity of the candidate neighborhood
+```
+
+---
+
+# 57. Entity-level decision strategy
+
+Recommended:
+
+```text
+For each S1:
+
+1. Score all candidates.
+2. Remove scores below τ.
+3. Apply high-confidence rules.
+4. Examine score distribution.
+5. Apply ambiguity/singleton logic.
+6. Output every surviving candidate.
+```
+
+---
+
+# 58. Singleton gate
+
+This deserves its own subsystem.
+
+A singleton should not simply mean:
+
+```text
+max probability < 0.5
+```
+
+Instead estimate:
+
+```text
+best_score
+second_best
+score_margin
+name_quality
+address_quality
+retrieval_agreement
+candidate_count
+```
+
+Then classify:
+
+```text
+MATCHED
+or
+SINGLETON
+```
+
+This is essentially a second decision problem.
+
+---
+
+# 59. Potential singleton classifier
+
+Train:
+
+```text
+S1 entity → has at least one true match?
+```
+
+Features:
+
+```text
+best candidate score
+best raw similarity
+candidate count
+best-second margin
+number of independent retrieval agreements
+name uniqueness
+address uniqueness
+field completeness
+```
+
+This could improve singleton precision without altering pair scoring.
+
+---
+
+# 60. Important caution
+
+Do not train singleton classification using information unavailable at test time.
+
+Everything must be based only on:
+
+```text
+S1
+candidate pool
+candidate scores
+training-derived statistics
+```
+
+---
+
+# 61. Candidate generation and matching must be evaluated separately
+
+Maintain a dashboard:
+
+| Metric             | Meaning              |
+| ------------------ | -------------------- |
+| Candidate recall   | Upper-bound recall   |
+| Avg candidates     | Efficiency           |
+| P95 candidates     | Tail cost            |
+| P99 candidates     | Worst-case cost      |
+| Reduction ratio    | Blocking compression |
+| Pair precision     | Matcher quality      |
+| Pair recall        | Matcher quality      |
+| Macro F₀.₅         | Challenge metric     |
+| Singleton accuracy | Empty-set handling   |
+
+Do not let F₀.₅ hide a blocking problem.
+
+---
+
+# 62. Ablation framework
+
+Every component should have:
+
+```text
+baseline
++ component
+Δ metric
+runtime Δ
+candidate Δ
+```
+
+Example:
+
+| Experiment    | Candidate Recall | Avg Candidates |  F₀.₅ |
+| ------------- | ---------------: | -------------: | ----: |
+| exact         |            82.4% |            3.2 |  0.61 |
+| + token       |            94.7% |            9.8 |  0.74 |
+| + char TF-IDF |            98.9% |           15.1 |  0.84 |
+| + adaptive    |            99.3% |           12.6 |  0.86 |
+| + ANN         |            99.6% |           19.3 | 0.861 |
+
+Then ANN may not justify itself.
+
+This is the kind of evidence-driven engineering the challenge rewards.
+
+---
+
+# 63. Three-stage retrieval is preferable
+
+I recommend:
+
+### Stage A — cheap retrieval
+
+```text
+exact keys
+```
+
+### Stage B — lexical retrieval
+
+```text
+TF-IDF char
+TF-IDF token
+```
+
+### Stage C — optional semantic retrieval
+
+```text
+ANN embeddings
+```
+
+Then:
+
+```text
+union → deduplicate → adaptive pruning
+```
+
+This gives high recall without applying expensive computation to everything.
+
+---
+
+# 64. Why BM25?
+
+BM25 can be tested for token-based retrieval.
+
+It handles term frequency and document length differently from TF-IDF and can be useful for address/name token retrieval.
+
+But I would not automatically choose BM25 over TF-IDF.
+
+The question is empirical:
+
+```text
+Does BM25 recover validation matches that TF-IDF misses
+at acceptable candidate cost?
+```
+
+If no:
+
+**remove BM25.**
+
+---
+
+# 65. Sorted-neighborhood blocking
+
+Also worth testing.
+
+Sort records by:
+
+```text
+normalized name
+```
+
+then compare within a window.
+
+This can recover:
+
+```text
+abc hospital
+abd hospital
+abe hospital
+```
+
+without all-pairs comparison.
+
+It is especially useful as a backup blocker.
+
+But character TF-IDF may make it redundant.
+
+---
+
+# 66. Approximate nearest neighbor
+
+Potentially useful for embeddings.
+
+But ANN adds:
+
+```text
+model
+embedding memory
+index
+serialization
+dependency
+runtime
+```
+
+The challenge emphasizes reproducibility and audits the complete submission package. 
+
+Therefore ANN must earn its complexity.
+
+---
+
+# 67. Recommended feature groups
+
+I would start with:
+
+```text
+NAME
+├── exact
+├── normalized exact
+├── edit
+├── Jaro-Winkler
+├── char TF-IDF
+├── token Jaccard
+├── token overlap
+├── rare-token overlap
+├── order similarity
+├── length statistics
+└── phonetic
+
+ADDRESS
+├── exact
+├── normalized exact
+├── edit
+├── char TF-IDF
+├── token Jaccard
+├── token overlap
+├── numbers
+├── postal
+├── house number
+├── component similarity
+└── length statistics
+
+COUNTRY
+├── exact
+├── conflict
+└── missingness
+
+META
+├── source pair
+├── missingness
+├── rarity
+├── candidate rank
+├── blocker count
+├── retrieval score
+├── best score
+└── ambiguity
+```
+
+---
+
+# 68. Model stacking
+
+A very strong final architecture may be:
+
+```text
+CatBoost
+      +
+LightGBM
+      ↓
+probability ensemble
+```
+
+But only do this if:
+
+```text
+ensemble validation F0.5 > best individual
+```
+
+by a meaningful margin.
+
+Otherwise it is unnecessary complexity.
+
+---
+
+# 69. Why I slightly prefer CatBoost as final
+
+Not because it is universally superior.
+
+Because this dataset naturally has:
+
+```text
+categorical country/source
+numeric similarity features
+missingness
+nonlinear interactions
+```
+
+CatBoost handles categorical and numerical data and missing values naturally. ([CatBoost][7])
+
+It is also easy to inspect feature importance.
+
+However:
+
+> **XGBoost must be a serious baseline.**
+
+If XGBoost wins by 0.01 F₀.₅, use XGBoost.
+
+Do not choose the algorithm by reputation.
+
+---
+
+# 70. Neural matcher experiment
+
+Only after the classical pipeline is strong:
+
+```text
+candidate pair
+ ↓
+serialized fields
+ ↓
+small multilingual/appropriate encoder
+ ↓
+pair score
+```
+
+Candidate count should be small enough that inference is manageable.
+
+The literature shows pretrained language-model entity matching can be powerful, but also that inference cost is a major consideration. Recent research explicitly contrasts traditional ML/small models with much slower LLM inference. ([arXiv][8])
+
+---
+
+# 71. Why not LLM-based matching
+
+Because:
+
+1. external service risk,
+2. reproducibility,
+3. licensing,
+4. runtime,
+5. hallucination/consistency,
+6. unnecessary complexity,
+7. structured numeric evidence is better handled explicitly.
+
+The challenge prohibits external business lookup and external data augmentation. 
+
+There is no need to introduce a compliance risk for marginal semantic gains.
+
+---
+
+# 72. Stand-out innovation #1 — blocker ensemble with evidence count
+
+For every candidate store:
+
+```text
+retrieved_exact_name = 1
+retrieved_char_name = 1
+retrieved_address = 1
+retrieved_postal = 0
+retrieved_token = 1
+```
+
+Then:
+
+```text
+retrieval_agreement = sum(...)
+```
+
+This converts blocking from a binary operation into evidence.
+
+---
+
+# 73. Stand-out innovation #2 — adaptive candidate budgets
+
+Instead of:
+
+```text
+top K for everyone
+```
+
+use:
+
+```text
+high-quality S1 → K=5
+medium → K=15
+weak → K=30/50
+```
+
+This directly attacks the challenge's:
+
+```text
+small candidate set
++
+high recall
+```
+
+tradeoff.
+
+---
+
+# 74. Stand-out innovation #3 — rarity-aware similarity
+
+Instead of:
+
+```text
+Jaccard = 0.8
+```
+
+alone, compute:
+
+```text
+weighted token overlap
+```
+
+where rare tokens have greater weight.
+
+Conceptually:
+
+$$
+sim_{idf}(A,B)=
+\frac{\sum_{t\in A\cap B}idf(t)}
+{\sum_{t\in A\cup B}idf(t)}
+$$
+
+This is much more meaningful for:
+
+```text
+Apollo
+```
+
+versus:
+
+```text
+QZX Diagnostics
+```
+
+---
+
+# 75. Stand-out innovation #4 — disagreement-aware singleton detection
+
+Use:
+
+```text
+best score
+second-best score
+margin
+retrieval agreement
+field completeness
+name rarity
+```
+
+to detect:
+
+```text
+no reliable match
+```
+
+rather than forcing a match.
+
+This directly targets the challenge's singleton scoring behavior. 
+
+---
+
+# 76. Stand-out innovation #5 — difficult-pair specialist
+
+Use a cascade:
+
+```text
+Easy
+ ↓
+CatBoost
+
+Uncertain
+ ↓
+specialized second-stage matcher
+```
+
+The specialist can be:
+
+```text
+small transformer
+```
+
+or simply:
+
+```text
+second CatBoost model trained specifically on hard negatives
+```
+
+I would test the latter first.
+
+---
+
+# 77. A surprisingly strong alternative: two CatBoost models
+
+Model 1:
+
+```text
+general pair classifier
+```
+
+Model 2:
+
+```text
+hard-negative classifier
+```
+
+Then:
+
+```text
+score_final = f(score_general, score_hard_negative)
+```
+
+This is cheaper and easier to reproduce than introducing a Transformer.
+
+---
+
+# 78. Final architecture
+
+## Layer 1 — ingestion
+
+```text
+TSV reader
+schema validation
+source identification
+```
+
+The specification requires TSV, and incorrectly reading the files without `sep="\t"` can collapse the file into one column. 
+
+---
+
+## Layer 2 — normalization
+
+```text
+raw
+light
+token
+compact
+transliterated
+numbers
+postal
+```
+
+---
+
+## Layer 3 — indexes
+
+```text
+exact hash indexes
+token inverted indexes
+char TF-IDF matrices
+address TF-IDF matrices
+optional ANN index
+```
+
+---
+
+## Layer 4 — multi-pass candidate generation
+
+```text
+exact
+rare-token
+char-name
+char-address
+token
+phonetic
+sorted-neighborhood
+optional ANN
+```
+
+---
+
+## Layer 5 — candidate consolidation
+
+```text
+union
+deduplicate
+adaptive pruning
+candidate diagnostics
+```
+
+This exact final candidate set becomes:
+
+```text
+candidate_pairs.tsv
+```
+
+The specification explicitly says this file must represent the candidates immediately before the matching model. 
+
+---
+
+# 79. Layer 6 — feature engine
+
+Generate pair features in vectorized/batched form.
+
+Avoid Python nested loops wherever possible.
+
+---
+
+# 80. Layer 7 — matcher
+
+Primary:
+
+```text
+CatBoost
+```
+
+Benchmark:
+
+```text
+XGBoost
+LightGBM
+Logistic regression
+```
+
+---
+
+# 81. Layer 8 — decision engine
+
+```text
+pair score
+ ↓
+calibration
+ ↓
+entity adaptive threshold
+ ↓
+margin/ambiguity
+ ↓
+singleton gate
+ ↓
+final IDs
+```
+
+---
+
+# 82. Layer 9 — output
+
+Generate:
+
+```text
+matching_results.tsv
+candidate_pairs.tsv
+```
+
+Every predicted match must be contained in candidate_pairs. The challenge explicitly warns that a match absent from candidates is a pipeline bug. 
+
+---
+
+# 83. Validation
+
+Run the provided validator:
+
+```bash
+python3 utils/validate_submission.py \
+    --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv \
+    --test-dir dataset/test
+```
+
+The challenge supplies this validator specifically to catch structural errors before submission. 
+
+---
+
+# 84. Experiment roadmap
+
+## Baseline
+
+```text
+normalization
++
+exact blocking
++
+Levenshtein/Jaccard
++
+Logistic Regression
+```
+
+Goal:
+
+Establish a trustworthy floor.
+
+---
+
+## V1 — classical retrieval
+
+Add:
+
+```text
+char TF-IDF
+token TF-IDF
+multi-pass blocking
+```
+
+Measure:
+
+```text
+candidate recall
+candidate reduction
+F0.5
+```
+
+---
+
+## V2 — strong pair model
+
+Replace logistic regression with:
+
+```text
+XGBoost
+CatBoost
+LightGBM
+```
+
+Same candidate set.
+
+This isolates the model effect.
+
+---
+
+## V3 — hard negatives + adaptive decisions
+
+Add:
+
+```text
+hard-negative mining
+candidate agreement
+rarity features
+adaptive threshold
+singleton gate
+margin
+```
+
+This is likely where a large performance jump occurs.
+
+---
+
+## V4 — retrieval innovation
+
+Test:
+
+```text
+ANN
+phonetic
+sorted neighborhood
+adaptive K
+```
+
+Keep only components that improve the Pareto frontier.
+
+---
+
+## Final
+
+Potential:
+
+```text
+multi-pass retrieval
++
+adaptive K
++
+CatBoost
++
+hard negatives
++
+rarity features
++
+entity-level threshold
++
+singleton gate
+```
+
+Optional:
+
+```text
+small transformer reranker
+```
+
+only if validation proves it worthwhile.
+
+---
+
+# 85. Experiment matrix
+
+| Exp   | Blocking            | Matcher           | Decision          | Purpose          |
+| ----- | ------------------- | ----------------- | ----------------- | ---------------- |
+| B0    | exact               | Logistic          | fixed             | floor            |
+| V1    | exact + token       | Logistic          | fixed             | blocking         |
+| V2    | multi-pass TF-IDF   | Logistic          | fixed             | retrieval        |
+| V3    | multi-pass TF-IDF   | XGB               | fixed             | model            |
+| V4    | multi-pass TF-IDF   | CatBoost          | fixed             | model            |
+| V5    | multi-pass          | CatBoost          | tuned τ           | F₀.₅             |
+| V6    | multi-pass          | CatBoost          | hard negatives    | robustness       |
+| V7    | multi-pass          | CatBoost          | adaptive τ        | precision        |
+| V8    | adaptive blocking   | CatBoost          | adaptive τ        | candidate Pareto |
+| V9    | +ANN                | CatBoost          | adaptive          | semantic recall  |
+| V10   | +specialist         | CatBoost ensemble | adaptive          | hard cases       |
+| Final | selected components | selected model    | selected decision | final            |
+
+---
+
+# 86. Advancement criterion
+
+Do not move to the next experiment simply because:
+
+```text
+F0.5 increased
+```
+
+Require:
+
+### Blocking
+
+```text
+candidate recall ↑
+while candidate count ↓ or remains acceptable
+```
+
+### Model
+
+```text
+F0.5 ↑
+```
+
+### Threshold
+
+```text
+macro F0.5 ↑
+singleton false-positive rate ↓
+```
+
+### Innovation
+
+```text
+F0.5 ↑
+OR
+candidate Pareto frontier improves substantially
+```
+
+Otherwise remove it.
+
+---
+
+# 87. Failure mode: random validation
+
+A random pair split may produce:
+
+```text
+very high validation
+poor leaderboard
+```
+
+because the validation distribution is too easy.
+
+### Prevention
+
+S1-grouped splits + hard-negative validation.
+
+---
+
+# 88. Failure mode: over-aggressive normalization
+
+Example:
+
+```text
+remove all numbers
+remove legal terms
+remove geographic terms
+```
+
+can merge different businesses.
+
+### Prevention
+
+Multi-view normalization.
+
+---
+
+# 89. Failure mode: candidate explosion
+
+You get:
+
+```text
+99.99% recall
+```
+
+but:
+
+```text
+2,000 candidates/S1
+```
+
+This violates the spirit of the updated candidate-generation requirement.
+
+### Prevention
+
+Pareto optimization and adaptive candidate budgets.
+
+---
+
+# 90. Failure mode: over-pruning
+
+You get:
+
+```text
+15 candidates/S1
+```
+
+but candidate recall:
+
+```text
+92%
+```
+
+Then no matcher can recover the lost matches.
+
+### Prevention
+
+Measure candidate recall before training the matcher.
+
+---
+
+# 91. Failure mode: common-name false merges
+
+```text
+"Shree Krishna Restaurant"
+```
+
+may occur many times.
+
+### Prevention
+
+Name rarity + address evidence + ambiguity margin.
+
+---
+
+# 92. Failure mode: exact-match worship
+
+```text
+same normalized name
+```
+
+does not necessarily imply same business.
+
+Use exact matches as features, not automatic truth.
+
+---
+
+# 93. Failure mode: nearest-neighbor assumption
+
+A Source-1 entity can match:
+
+```text
+S2-A
+S2-B
+S3-C
+```
+
+simultaneously.
+
+Therefore never force:
+
+```text
+argmax(score)
+```
+
+as the output.
+
+---
+
+# 94. Failure mode: treating France as OOD rejection
+
+The challenge explicitly says France appears in test and must be included. 
+
+Therefore:
+
+```text
+unknown country
+```
+
+must mean:
+
+```text
+valid string value
+```
+
+not:
+
+```text
+reject
+```
+
+---
+
+# 95. Failure mode: external enrichment
+
+Do not:
+
+```text
+Google business
+Google Maps
+OpenStreetMap geocoding
+company registration
+business directories
+external APIs
+web search
+```
+
+The prohibition explicitly includes commercial ER APIs, government business registrations, geocoding APIs, and external internet data augmentation. 
+
+Even if an external lookup would dramatically improve the score, it is disqualifying.
+
+---
+
+# 96. What external research *is* acceptable
+
+There is an important distinction.
+
+### Acceptable
+
+Researching:
+
+```text
+TF-IDF
+BM25
+blocking algorithms
+XGBoost
+CatBoost
+entity-resolution papers
+string similarity algorithms
+general transliteration algorithms
+```
+
+and implementing those methods locally.
+
+### Not acceptable
+
+Using:
+
+```text
+external business database
+Google Maps API
+company registry
+business directory
+web search to identify a business
+```
+
+The challenge explicitly says it is designed around using the supplied training data. 
+
+---
+
+# 97. What I would NOT build
+
+## ❌ Giant LLM matcher
+
+Unnecessary and expensive.
+
+## ❌ External business lookup
+
+Disqualification risk.
+
+## ❌ Geocoding
+
+Explicitly prohibited.
+
+## ❌ Massive graph neural network
+
+No demonstrated need.
+
+## ❌ End-to-end Transformer from day one
+
+Wrong optimization order.
+
+## ❌ Single blocking key
+
+Too brittle.
+
+## ❌ One global normalization string
+
+Information destructive.
+
+## ❌ Top-1 matching
+
+Incorrect because multiple matches are allowed.
+
+## ❌ Fixed 0.5 threshold
+
+Metric mismatch.
+
+## ❌ Random pair validation
+
+Leakage risk.
+
+## ❌ Huge feature zoo without ablations
+
+Creates noise and overfitting.
+
+---
+
+# 98. CPU/RAM optimization
+
+Given your development machine, I would intentionally design the system for CPU execution.
+
+### Use
+
+```text
+Polars/pandas
+NumPy
+SciPy sparse matrices
+scikit-learn
+RapidFuzz
+XGBoost/LightGBM/CatBoost
+```
+
+### Avoid
+
+```text
+GPU-only pipeline
+large transformer inference over all pairs
+dense similarity matrices
+Python nested loops
+```
+
+---
+
+# 99. Sparse TF-IDF
+
+Never construct:
+
+```text
+N × M dense similarity matrix
+```
+
+Use:
+
+```text
+scipy.sparse
+```
+
+and retrieve top-k candidates.
+
+This can reduce memory by orders of magnitude.
+
+---
+
+# 100. Caching
+
+Cache:
+
+```text
+normalized strings
+tokens
+n-grams
+numeric extraction
+postal extraction
+TF-IDF matrices
+candidate lists
+pair features
+```
+
+Do not recompute them for every experiment.
+
+---
+
+# 101. Experiment reproducibility
+
+Pin:
+
+```text
+Python
+numpy
+pandas/polars
+scikit-learn
+rapidfuzz
+xgboost
+lightgbm
+catboost
+scipy
+```
+
+The final package explicitly requires pinned dependencies and reproducibility. 
+
+Also record:
+
+```text
+random seed
+feature version
+normalization version
+blocking configuration
+model parameters
+threshold
+candidate K
+```
+
+---
+
+# 102. Recommended project structure
+
+```text
+business_entity_resolution/
+│
+├── src/
+│   ├── config.py
+│   ├── io.py
+│   ├── eda.py
+│   │
+│   ├── normalization/
+│   │   ├── names.py
+│   │   ├── addresses.py
+│   │   ├── numbers.py
+│   │   └── transliteration.py
+│   │
+│   ├── blocking/
+│   │   ├── exact.py
+│   │   ├── tfidf.py
+│   │   ├── tokens.py
+│   │   ├── phonetic.py
+│   │   └── ensemble.py
+│   │
+│   ├── features/
+│   │   ├── name.py
+│   │   ├── address.py
+│   │   ├── rarity.py
+│   │   └── meta.py
+│   │
+│   ├── models/
+│   │   ├── logistic.py
+│   │   ├── xgboost.py
+│   │   ├── lightgbm.py
+│   │   └── catboost.py
+│   │
+│   ├── decision/
+│   │   ├── threshold.py
+│   │   ├── singleton.py
+│   │   └── postprocess.py
+│   │
+│   ├── evaluation/
+│   │   ├── f05.py
+│   │   ├── blocking.py
+│   │   └── experiments.py
+│   │
+│   └── pipeline.py
+│
+├── README.md
+└── requirements.txt
+```
+
+---
+
+# 103. Exact implementation phases
+
+## Phase 0 — Data audit
+
+Implement:
+
+```text
+schema validation
+row counts
+missingness
+duplicates
+country distribution
+cardinality
+singleton rate
+```
+
+### Done when
+
+You can produce a complete EDA report with no unknown dataset statistics.
+
+---
+
+## Phase 1 — Normalization
+
+Implement:
+
+```text
+5 name views
+5 address views
+numbers
+postal candidates
+tokens
+rarity statistics
+```
+
+### Done when
+
+Every transformation is deterministic and unit-tested.
+
+---
+
+## Phase 2 — Blocking framework
+
+Implement each blocker independently.
+
+```text
+exact
+token
+char TF-IDF
+address TF-IDF
+phonetic
+sorted neighborhood
+```
+
+### Done when
+
+You can measure each blocker's:
+
+```text
+recall
+candidate count
+reduction ratio
+runtime
+```
+
+---
+
+## Phase 3 — Blocking ensemble
+
+Combine blockers.
+
+### Done when
+
+You have a candidate Pareto curve.
+
+Target conceptually:
+
+```text
+near-perfect candidate recall
+with minimum candidate volume
+```
+
+Do not hard-code the target until the actual data is measured.
+
+---
+
+## Phase 4 — Pair features
+
+Implement:
+
+```text
+name
+address
+postal
+numeric
+rarity
+retrieval
+missingness
+source
+```
+
+### Done when
+
+Feature generation is deterministic and leakage-free.
+
+---
+
+## Phase 5 — Baseline model
+
+Train:
+
+```text
+Logistic Regression
+```
+
+### Done when
+
+You have a reproducible F₀.₅ baseline.
+
+---
+
+## Phase 6 — Tree models
+
+Train:
+
+```text
+XGBoost
+LightGBM
+CatBoost
+```
+
+### Done when
+
+You have identical validation comparisons.
+
+---
+
+## Phase 7 — Hard-negative mining
+
+Generate:
+
+```text
+same name
+same address
+same postal
+high lexical similarity
+blocker collisions
+```
+
+### Done when
+
+Hard-negative F₀.₅ is substantially better than random-negative training or demonstrably more robust.
+
+---
+
+## Phase 8 — Decision optimization
+
+Optimize:
+
+```text
+global threshold
+entity threshold
+margin
+singleton classifier
+```
+
+### Done when
+
+Macro F₀.₅ improves on untouched validation.
+
+---
+
+## Phase 9 — Advanced retrieval
+
+Test:
+
+```text
+BM25
+ANN
+phonetic
+sorted neighborhood
+adaptive K
+```
+
+### Done when
+
+Every added method has a measured benefit.
+
+---
+
+## Phase 10 — Final inference
+
+Run:
+
+```text
+test S1
+→ candidates
+→ features
+→ model
+→ decisions
+```
+
+---
+
+## Phase 11 — submission validation
+
+Check:
+
+```text
+all S1 rows
+no duplicates
+valid IDs
+S2/S3 only
+matches ⊆ candidates
+empty singleton format
+TSV correctness
+```
+
+The challenge validator is specifically intended for these checks. 
+
+---
+
+# 104. Definition of done by stage
+
+| Stage              | Definition of done                     |
+| ------------------ | -------------------------------------- |
+| EDA                | All important distributions measured   |
+| Normalization      | Deterministic + unit tested            |
+| Blocking           | Recall and reduction measured          |
+| Candidate ensemble | Pareto-optimal candidate configuration |
+| Features           | Leakage-free feature matrix            |
+| Baseline           | Reproducible F₀.₅                      |
+| Model              | Best model statistically demonstrated  |
+| Negatives          | Hard-negative benefit proven           |
+| Threshold          | F₀.₅ optimized                         |
+| Singleton          | Empty prediction behavior validated    |
+| Advanced methods   | Added only with measurable gain        |
+| Inference          | Deterministic                          |
+| Submission         | Validator PASS                         |
+| Documentation      | Reproducible methodology               |
+| Package            | Clean runnable ZIP                     |
+
+---
+
+# 105. Top 5 highest-impact innovations
+
+## 1. Adaptive multi-pass blocking
+
+**Impact:** Very high.
+
+Combine:
+
+```text
+exact
+rare token
+char TF-IDF
+address TF-IDF
+optional ANN
+```
+
+with adaptive candidate budgets.
+
+---
+
+## 2. Rarity-aware pair scoring
+
+Instead of treating:
+
+```text
+common token = rare token
+```
+
+use IDF/rarity evidence.
+
+This should reduce common-name false merges.
+
+---
+
+## 3. Hard-negative mining from the actual blocker
+
+Train against the mistakes your retrieval system actually generates.
+
+This aligns training distribution with inference distribution.
+
+---
+
+## 4. Entity-level singleton + ambiguity decision layer
+
+Do not reduce matching to:
+
+```text
+pair_probability > threshold
+```
+
+Use:
+
+```text
+best score
+second-best
+margin
+retrieval agreement
+field quality
+rarity
+```
+
+to decide whether an entity should receive matches at all.
+
+---
+
+## 5. Retrieval-evidence features
+
+Record:
+
+```text
+which blockers retrieved the pair
+how many independent blockers agreed
+retrieval rank
+retrieval score
+```
+
+and feed these into the classifier.
+
+This makes the entire retrieval system contribute information to matching.
+
+---
+
+# 106. Recommended final stack
+
+### Language
+
+```text
+Python 3.x
+```
+
+### Data
+
+```text
+Polars or pandas
+NumPy
+SciPy
+```
+
+### String processing
+
+```text
+RapidFuzz
+scikit-learn
+```
+
+### Retrieval
+
+```text
+exact inverted indexes
+TF-IDF character n-grams
+TF-IDF token retrieval
+optional BM25
+optional ANN
+```
+
+### Model
+
+**Primary:**
+
+```text
+CatBoost
+```
+
+**Benchmarks:**
+
+```text
+XGBoost
+LightGBM
+Logistic Regression
+```
+
+### Optional advanced model
+
+```text
+small Apache/MIT-licensed multilingual Transformer
+```
+
+only if it demonstrably improves validation.
+
+### Metrics
+
+```text
+macro F0.5
+candidate recall
+reduction ratio
+candidate count
+singleton accuracy
+false merge rate
+```
+
+---
+
+# 107. Architecture diagram
+
+```text
+                 ┌───────────────────────┐
+                 │       TRAIN DATA      │
+                 │ S1 / S2 / S3 / GT     │
+                 └───────────┬───────────┘
+                             │
+                     ┌───────▼───────┐
+                     │      EDA      │
+                     └───────┬───────┘
+                             │
+                     ┌───────▼────────┐
+                     │ Multi-view      │
+                     │ normalization   │
+                     └───────┬────────┘
+                             │
+        ┌────────────────────┼─────────────────────┐
+        │                    │                     │
+   Exact indexes       TF-IDF indexes        Optional ANN
+        │                    │                     │
+        └────────────────────┼─────────────────────┘
+                             │
+                     ┌───────▼────────┐
+                     │ Multi-pass     │
+                     │ blocking       │
+                     └───────┬────────┘
+                             │
+                     ┌───────▼────────┐
+                     │ Candidate      │
+                     │ union + dedup  │
+                     └───────┬────────┘
+                             │
+                    candidate diagnostics
+                             │
+                     ┌───────▼────────┐
+                     │ Pair features  │
+                     └───────┬────────┘
+                             │
+                 ┌───────────┼────────────┐
+                 │           │            │
+               XGB       CatBoost      LightGBM
+                 │           │            │
+                 └───────────┼────────────┘
+                             │
+                     best validated model
+                             │
+                     ┌───────▼────────┐
+                     │ Decision layer  │
+                     │ threshold       │
+                     │ margin          │
+                     │ singleton gate  │
+                     └───────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │ Final matches   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴─────────────┐
+              │                            │
+     matching_results.tsv        candidate_pairs.tsv
+```
+
+---
+
+# 108. Compliance audit
+
+| Proposed component                  | Compliance |
+| ----------------------------------- | ---------- |
+| Exact blocking                      | ✅          |
+| TF-IDF                              | ✅          |
+| Character n-grams                   | ✅          |
+| Jaccard                             | ✅          |
+| Levenshtein                         | ✅          |
+| Jaro-Winkler                        | ✅          |
+| BM25                                | ✅          |
+| Phonetic encoding                   | ✅          |
+| Offline transliteration             | ✅*         |
+| XGBoost                             | ✅          |
+| LightGBM                            | ✅          |
+| CatBoost                            | ✅          |
+| Offline embeddings                  | ✅*         |
+| Local Transformer                   | ✅*         |
+| Hard-negative mining                | ✅          |
+| Candidate adaptive K                | ✅          |
+| Cross-validation                    | ✅          |
+| External business lookup            | ❌          |
+| Google Maps lookup                  | ❌          |
+| Geocoding API                       | ❌          |
+| Government registry                 | ❌          |
+| Business directory                  | ❌          |
+| External business-data augmentation | ❌          |
+| Commercial ER API                   | ❌          |
+
+*Subject to the final model/dependency licensing requirement and reproducibility.
+
+The prohibition is explicit and broad: external databases/APIs/services for business identity resolution, government registrations, geocoding APIs, and internet-based external data augmentation are prohibited. 
+
+---
+
+# 109. Final submission checklist
+
+## Data
+
+* [ ] Correct TSV parsing
+* [ ] S1/S2/S3 schema verified
+* [ ] Ground truth parsed correctly
+* [ ] Cardinality distribution measured
+* [ ] Singleton rate measured
+* [ ] Missingness measured
+* [ ] Country distribution measured
+
+## Normalization
+
+* [ ] Raw fields preserved
+* [ ] Light normalization
+* [ ] Token normalization
+* [ ] Compact/alphanumeric view
+* [ ] Number extraction
+* [ ] Postal extraction
+* [ ] Transliteration tested
+* [ ] No destructive global normalization
+
+## Blocking
+
+* [ ] Exact blocking
+* [ ] Rare-token blocking
+* [ ] Character TF-IDF
+* [ ] Address retrieval
+* [ ] Token retrieval
+* [ ] Optional phonetic
+* [ ] Optional ANN
+* [ ] Multi-pass union
+* [ ] Candidate recall measured
+* [ ] Reduction ratio measured
+* [ ] P95/P99 candidate counts measured
+* [ ] Adaptive K tested
+
+## Matching
+
+* [ ] Logistic baseline
+* [ ] XGBoost
+* [ ] LightGBM
+* [ ] CatBoost
+* [ ] Same features for fair comparison
+* [ ] Hard negatives
+* [ ] Rarity features
+* [ ] Retrieval-agreement features
+* [ ] Source-pair features
+
+## Decision
+
+* [ ] Global threshold sweep
+* [ ] F₀.₅ optimization
+* [ ] Margin features
+* [ ] Adaptive threshold tested
+* [ ] Singleton classifier/gate tested
+* [ ] Multiple matches supported
+
+## Validation
+
+* [ ] S1-level split
+* [ ] No pair leakage
+* [ ] No target-derived normalization
+* [ ] No target-derived blocking
+* [ ] Hard-negative validation
+* [ ] Holdout untouched
+* [ ] Ablation results recorded
+
+## Submission
+
+* [ ] Every S1 appears exactly once
+* [ ] S2/S3 only
+* [ ] No duplicate IDs
+* [ ] Empty singleton lists formatted correctly
+* [ ] Every final match is a candidate
+* [ ] `candidate_pairs.tsv` is the **actual final model input**
+* [ ] Validator returns `PASS`
+* [ ] Dependencies pinned
+* [ ] Model license verified
+* [ ] No external data access
+* [ ] README reproduces entire pipeline
+* [ ] Methodology document completed
+
+The submission structure and reproducibility requirements are explicitly specified by the challenge. 
+
+---
+
+# Bottom line
+
+The strongest defensible solution is **not**:
+
+> “Use the biggest multilingual Transformer.”
+
+It is:
+
+> **Build an exceptionally good retrieval system, then let a compact supervised model make the difficult pairwise decisions, followed by an entity-level precision/singleton decision layer.**
+
+The most important optimization hierarchy should be:
+
+```text
+                 IMPACT
+
+1. Candidate recall / blocking       ██████████
+2. Candidate precision / size       █████████
+3. Pair feature quality             █████████
+4. Hard-negative training            ████████
+5. F0.5 decision logic               ████████
+6. Model selection                    ██████
+7. Transformer/embedding sophistication ███
+```
+
+This ordering follows both the challenge's explicit candidate-generation requirement and established entity-matching architecture: blocking reduces the search space, while the matcher makes the expensive final decision. ([CS UW][2])
+
+The uploaded methodology template also confirms that the final write-up must explicitly document **problem analysis, candidate generation, features, model architecture, threshold selection, results, false positives/negatives, and reproducibility artifacts**. 
+
+### The next technically correct step
+
+Before implementing the proposed architecture, **run Phase 0 on the actual training TSVs**. We currently have the authoritative specification and documentation, but not the underlying training tables in the uploaded materials. Without those tables, claims about actual imbalance, singleton rate, cardinality, country distribution, blocker recall, or optimal candidate K would be fabricated.
+
+Once the training files are available, the highest-value next analysis is:
+
+```text
+EDA
+→ cardinality/singletons
+→ noise characterization
+→ exact-match coverage
+→ blocker recall curves
+→ candidate-count Pareto frontier
+→ hard-negative distribution
+```
+
+That will allow the architecture above to be converted from a research-backed design into **dataset-specific engineering decisions rather than assumptions**.
+
+[1]: https://moj-analytical-services.github.io/splink/topic_guides/comparisons/term-frequency.html?utm_source=chatgpt.com "Term frequency adjustments - Splink"
+[2]: https://pages.cs.wisc.edu/~anhai/projects/magellan/about.html?utm_source=chatgpt.com "Magellan – About"
+[3]: https://recordlinkage.readthedocs.io/en/stable/ref-index.html?utm_source=chatgpt.com "1. Indexing — Python Record Linkage Toolkit 0.15 documentation"
+[4]: https://github.com/huggingface/sentence-transformers/blob/main/examples/sentence_transformer/training/multilingual/README.md?utm_source=chatgpt.com "sentence-transformers/examples/sentence_transformer/training/multilingual/README.md at main · huggingface/sentence-transformers · GitHub"
+[5]: https://xgboost.readthedocs.io/en/stable/?utm_source=chatgpt.com "XGBoost Documentation — xgboost 3.4.2 documentation"
+[6]: https://lightgbm.readthedocs.io/en/latest/Advanced-Topics.html?utm_source=chatgpt.com "Advanced Topics — LightGBM 4.7.0.99 documentation"
+[7]: https://catboost.ai/docs/en/concepts/algorithm-main-stages_cat-to-numberic?utm_source=chatgpt.com "Transforming categorical features to numerical features | CatBoost"
+[8]: https://arxiv.org/abs/2004.00584?utm_source=chatgpt.com "Deep Entity Matching with Pre-Trained Language Models"

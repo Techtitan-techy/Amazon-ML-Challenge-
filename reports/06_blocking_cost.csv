@@ -1,0 +1,7 @@
+blocker,recall,avg_candidates_per_s1,p95_candidates,p99_candidates,max_candidates,reduction_ratio
+B1_exact_name,0.2077,9.59,79.0,199.38999999999942,458,0.99999907
+B2_exact_address,0.0803,0.34,3.0,6.0,13,0.99999997
+B3_name_and_address,0.0122,0.04,2.0,2.0,4,1.0
+B4_name_and_postal,0.0109,0.04,3.0,4.0,6,1.0
+B5_address_and_postal,0.0291,1.87,92.0,129.69000000000005,160,0.99999982
+B10_hybrid_exact_union,0.2758,9.89,73.64999999999782,192.0,459,0.99999904

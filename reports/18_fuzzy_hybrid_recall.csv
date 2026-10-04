@@ -1,0 +1,7 @@
+channel,recall,hits,total_candidates,avg_cand_per_s1
+exact_name,0.2542,17528,24149,1.21
+exact_addr,0.084,5791,5833,0.29
+name_char_tfidf,0.8052,55528,400000,20.0
+addr_char_tfidf,0.9134,62990,400000,20.0
+word_tfidf,0.9881,68142,400000,20.0
+HYBRID_UNION_ALL,0.9931,68486,955383,47.77

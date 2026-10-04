@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and IDE files
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
+
+# Competition data and generated predictions
+6ab10eb3b23ba_student_resource.zip
+*.tsv
+output/
+
+# Generated model/training artifacts
+catboost_info/
+*.log
+
+# Local archives and packaged submissions
+Team_Mani_submission.zip
+*.zip
+
+# Preserve the original nested working repository locally; publish its snapshot instead
+/Team_Mani_submission/

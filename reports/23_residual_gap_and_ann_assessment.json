@@ -1,0 +1,8 @@
+{
+  "hybrid_candidate_recall": 0.9931,
+  "residual_gap_pct": 0.69,
+  "pct_missed_missing_address": 18.1,
+  "pct_missed_acronyms_length": 2.1,
+  "ann_required": false,
+  "recommendation": "**Conclusion**: The residual recall gap is small (0.69%). Classical character n-gram + token TF-IDF + exact union captures over 99.3% of true matches at zero GPU cost, sub-second latency, and 100% deterministic reproducibility for the competition code audit. Heavy embedding models / ANN are NOT strictly required to achieve top leaderboard performance, and would introduce substantial inference latency and out-of-memory risks on 10.32M records without closing the missing-address gap."
+}

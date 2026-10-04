@@ -1,0 +1,44 @@
+[
+  {
+    "root_cause": "indic_phonetic_distance",
+    "count": 169,
+    "percentage_of_missed": 35.43,
+    "pct_of_all_eval_gt": 0.2451
+  },
+  {
+    "root_cause": "missing_target_address",
+    "count": 87,
+    "percentage_of_missed": 18.24,
+    "pct_of_all_eval_gt": 0.1262
+  },
+  {
+    "root_cause": "state_acronym_or_short_address",
+    "count": 79,
+    "percentage_of_missed": 16.56,
+    "pct_of_all_eval_gt": 0.1146
+  },
+  {
+    "root_cause": "other_residual",
+    "count": 68,
+    "percentage_of_missed": 14.26,
+    "pct_of_all_eval_gt": 0.0986
+  },
+  {
+    "root_cause": "severe_name_typo_or_corruption",
+    "count": 48,
+    "percentage_of_missed": 10.06,
+    "pct_of_all_eval_gt": 0.0696
+  },
+  {
+    "root_cause": "address_token_displacement",
+    "count": 14,
+    "percentage_of_missed": 2.94,
+    "pct_of_all_eval_gt": 0.0203
+  },
+  {
+    "root_cause": "name_acronym_or_extreme_truncation",
+    "count": 12,
+    "percentage_of_missed": 2.52,
+    "pct_of_all_eval_gt": 0.0174
+  }
+]

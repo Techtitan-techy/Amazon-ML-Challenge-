@@ -1,0 +1,3 @@
+country,pair_count,name_exact_rate,name_levenshtein_mean,addr_exact_rate,addr_levenshtein_mean,postal_match_rate,both_addr_present_rate
+US,83090,0.3046,0.7869,0.0871,0.6402,0.0761,0.9528
+India,55893,0.1852,0.7277,0.0791,0.6558,0.0,0.9606

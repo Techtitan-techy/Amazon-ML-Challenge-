@@ -1,0 +1,4 @@
+cardinality_bucket,s1_count,pct_best_score_above_80,pct_best_score_below_40,mean_margin
+0_matches,1584,26.33,71.46,0.2453
+1_match,640,99.69,0.16,0.9858
+2+_matches,10803,99.99,0.0,0.0062

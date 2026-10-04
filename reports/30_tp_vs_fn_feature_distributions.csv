@@ -1,0 +1,12 @@
+feature,TP_mean,TP_median,FN_mean,FN_median,delta_mean (FN - TP)
+addr_jaccard,0.6309,0.6667,0.2334,0.1667,-0.3975
+both_addr_present,0.9731,1.0,0.646,1.0,-0.327
+addr_jaro_winkler,0.8352,0.8848,0.4676,0.6216,-0.3676
+addr_levenshtein,0.6669,0.7317,0.3022,0.2643,-0.3648
+name_jaro_winkler,0.9188,0.9524,0.7892,0.8716,-0.1296
+name_jaccard,0.6691,0.6667,0.4145,0.5,-0.2547
+name_levenshtein,0.7757,0.8095,0.5506,0.5798,-0.2251
+retrieval_score,0.9441,0.9815,0.7912,0.8136,-0.1528
+house_num_match,0.3931,0.0,0.0712,0.0,-0.3219
+postal_match,0.0484,0.0,0.0056,0.0,-0.0427
+oof_prob,0.9847,0.999,0.3453,0.3665,-0.6395

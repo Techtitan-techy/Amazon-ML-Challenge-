@@ -1,0 +1,6 @@
+view,unique_names_sample,name_collision_rate,avg_name_freq,max_name_freq,name_exact_gt_recall,unique_addrs_sample,addr_collision_rate,avg_addr_freq,max_addr_freq,addr_exact_gt_recall,both_exact_gt_recall,either_exact_gt_recall,time_sec
+raw,46982,0.0604,1.064,11,0.0483,49921,0.0016,1.002,3,0.0214,0.0,0.0697,0.11
+light_normalized,46783,0.0643,1.069,11,0.2166,49921,0.0016,1.002,3,0.0804,0.0128,0.2842,0.9
+token_normalized,46311,0.0738,1.08,11,0.338,49887,0.0023,1.002,3,0.1248,0.0307,0.4321,3.14
+compact_normalized,46749,0.065,1.07,11,0.2669,49921,0.0016,1.002,3,0.0813,0.0164,0.3318,1.72
+transliterated,46783,0.0643,1.069,11,0.2554,49921,0.0016,1.002,3,0.0809,0.0153,0.321,1.62
